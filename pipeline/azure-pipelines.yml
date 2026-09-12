@@ -1,0 +1,174 @@
+trigger:
+  - main
+
+variables:
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  namespaceJob: 'job-testes-$(Build.BuildId)'
+  projectDirectory: '$(Build.SourcesDirectory)/src/ConsoleAppJobHttpRequest'
+  containerRepository: 'job-httprequest'
+  kubernetesYamlDirectory: '$(Build.SourcesDirectory)/kubernetes'
+  workloadDefinition: 'job-notificacao-http.yaml'
+  urlKorRelease: 'https://github.com/yonahd/kor/releases/download/v0.6.8/kor_Linux_x86_64.tar.gz'
+
+stages:
+- stage: ClusterAnalysis
+  displayName: Cluster Analysis stage
+  jobs:
+  - job: ClusterAnalysis
+    displayName: Cluster Analysis
+    pool:
+      vmImage: $(vmImageName)
+    variables:
+      - group: vg-container-registry
+    steps:
+    - task: Kubernetes@1
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: 'aks-testes'
+        command: 'login'
+      displayName: 'Efetuar login no cluster'
+    - script: kubectl get namespaces
+      displayName: "Exibindo namespaces existentes"
+    - script: |
+        set -e
+
+        mkdir -p tmp-kor
+        cd tmp-kor
+
+        echo ""
+        echo "URL utilizada para download do Kor:"
+        echo "$(urlKorRelease)"
+        echo ""
+
+        curl -L -o kor.tar.gz "$(urlKorRelease)"
+
+        tar -xvzf kor.tar.gz
+
+        ls -la
+
+        chmod +x kor
+
+        sudo mv kor /usr/local/bin/
+
+        cd ..
+        rm -rf tmp-kor
+      displayName: "Instalar o Kor"
+    - script: |
+        kor --help
+      displayName: "Testar o Kor"
+    - script: |
+        kubectl create namespace testeskor01 --dry-run=client -o yaml | kubectl apply -f -
+      displayName: 'Criar (se não existir) o namespace testeskor01'
+    - script: |
+        kubectl create namespace testeskor02 --dry-run=client -o yaml | kubectl apply -f -
+      displayName: 'Criar (se não existir) o namespace testeskor02'
+    - script: |
+        cd ./k8s
+        kubectl apply -f test-configmap.yaml -n testeskor01
+      displayName: "Criar ConfigMap de teste no namespace testeskor01"
+    - script: |
+        cd ./k8s
+        kubectl apply -f test-configmap.yaml -n testeskor02
+      displayName: "Criar ConfigMap de teste no namespace testeskor02"
+    - script: |
+        cd ./k8s
+        kubectl apply -f test-secret.yaml -n testeskor01
+      displayName: "Criar Secret de teste no namespace testeskor01"
+    - script: |
+        kor all --output table --include-namespaces testeskor01,testeskor02
+      displayName: "Analisar recursos não utilizados no Kubernetes (Table output)"
+    - script: |
+        kor all --output json --include-namespaces testeskor01,testeskor02 | tee kor-output.json
+      displayName: "Analisar recursos nao utilizados no Kubernetes (JSON output)"
+    - task: Bash@3
+      displayName: 'Executar Kor e Gerar SARIF'
+      inputs:
+        targetType: 'inline'
+        script: |
+          #!/bin/bash
+          echo "==> Executando o Kor para coletar recursos não utilizados..."
+          
+          # 1. Processa o JSON usando Python inline sem tipos de objetos fixos
+          python3 -c "
+          import json
+          import os
+
+          # Inicializa a estrutura básica do SARIF com uma única regra genérica dinâmica
+          sarif = {
+              '\$schema': 'https://azurewebsites.net',
+              'version': '2.1.0',
+              'runs': [{
+                  'tool': {
+                      'driver': {
+                          'name': 'Kor',
+                          'informationUri': 'https://kubernetes-top10.owasp.org/2025/en/src/K07-Misconfigured-And-Vulnerable-Cluster-Components.html',
+                          'rules': [
+                              {
+                                  'id': 'OWASP-K07-2025',
+                                  'name': 'OWASP Kubernetes Top 10 - K07',
+                                  'shortDescription': {'text': 'Recurso do Kubernetes não utilizado'},
+                                  'fullDescription': {'text': 'Recursos detectados pelo Kor que foram criados no cluster mas não possuem uso ativo.'},
+                                  'defaultConfiguration': {'level': 'warning'},
+                                  'helpUri': 'https://kubernetes-top10.owasp.org/2025/en/src/K07-Misconfigured-And-Vulnerable-Cluster-Components.html',
+                              }
+                          ]
+                      }
+                  },
+                  'results': []
+              }]
+          }
+
+          # Verifica se o arquivo do Kor existe e tem conteúdo
+          if os.path.exists('kor-output.json') and os.path.getsize('kor-output.json') > 0:
+              try:
+                  with open('kor-output.json', 'r') as f:
+                      content = f.read().strip()
+                      
+                  if content:
+                      data = json.loads(content)
+                      
+                      # Varre os namespaces (0 a N)
+                      for ns, resources in data.items():
+                          if not isinstance(resources, dict):
+                              continue
+                          
+                          # Varre os tipos de recursos diretamente do JSON (ex: ConfigMap, Secret, etc.)
+                          for resource_type, items in resources.items():
+                              if not isinstance(items, list):
+                                  continue
+                                  
+                              # Varre cada item individual (0 a N)
+                              for item in items:
+                                  # Monta a mensagem e o caminho lendo o tipo diretamente do JSON
+                                  msg = f'O recurso do tipo \"{resource_type}\" chamado \"{item}\" não está sendo utilizado no namespace \"{ns}\".'
+                                  uri_path = f'k8s/{ns}/{resource_type.lower()}-{item}.yaml'
+                                  
+                                  # Injeta o resultado no padrão SARIF
+                                  sarif['runs'][0]['results'].append({
+                                      'ruleId': 'OWASP-K07-2025',
+                                      'message': {'text': msg}
+                                  })
+              except Exception as e:
+                  print(f'Erro ao processar JSON: {e}')
+
+          # Salva o relatório final SARIF
+          with open('kor-report.sarif', 'w', encoding='utf-8') as f:
+              json.dump(sarif, f, indent=2, ensure_ascii=False)
+              
+          total_alertas = len(sarif['runs'][0]['results'])
+          print(f'==> Relatório SARIF gerado com sucesso! Total de inconsistências encontradas: {total_alertas}')"
+    - script: |
+        ls -l
+      displayName: "Exibir arquivos no diretorio-raiz"
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: './kor-report.sarif'
+        artifact: 'CodeAnalysisLogs'
+        publishLocation: 'pipeline'
+      displayName: 'Publish SARIF to Scans Tab'
+    - script: |
+        kubectl delete namespace testeskor01
+        kubectl delete namespace testeskor02
+      displayName: "Remover Namespaces de tetes (com ConfigMaps e Secret de testes)"

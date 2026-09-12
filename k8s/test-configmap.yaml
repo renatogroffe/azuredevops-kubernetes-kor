@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-config
+data:
+  bacon-ipsum-endpoint: "https://baconipsum.com/api/?type=meat-and-filler&paras=2"
+  bacon-ipsum-endpoint2: "https://baconipsum.com/api/?type=meat-and-filler&paras=3"
