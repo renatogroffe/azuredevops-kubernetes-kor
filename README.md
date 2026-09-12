@@ -1,5 +1,5 @@
-# azuredevops-kubernetes-kor
-Exemplo de uso da ferramenta Kor analisando workloads (ConfigMaps, Secrets) em desuso em um cluster Kubernetes.
+# azuredevops-kubernetes-kor-sarif
+Exemplo de uso da ferramenta Kor analisando workloads (ConfigMaps, Secrets) em desuso em um cluster Kubernetes. Inclui a geração de um arquivo SARIF com aleartas de objetos órfãos.
 
 ## Testes
 
